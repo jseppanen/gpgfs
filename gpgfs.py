@@ -15,6 +15,8 @@ from cStringIO import StringIO
 
 magic = 'GPGFS1\n'
 
+log = logging.getLogger(__name__)
+
 def decrypt(gpg, path):
     data = file(path).read()
     if not data:
@@ -118,14 +120,13 @@ def read_atom(fd):
     return fd.read(struct.unpack('<I', fd.read(4))[0])
 
 class LoggingMixIn:
-    log = logging.getLogger('gpgfs')
 
     def __call__(self, op, path, *args):
         if op=='write':
             atxt = ' '.join([repr(args[0])[:10], repr(args[1]), repr(args[2])])
         else:
             atxt = ' '.join(map(repr, args))
-        self.log.debug('-> %s %s %s', op, path, atxt)
+        log.debug('-> %s %s %s', op, repr(path), atxt)
         ret = '[Unhandled Exception]'
         try:
             ret = getattr(self, op)(path, *args)
@@ -137,10 +138,10 @@ class LoggingMixIn:
             rtxt = repr(ret)
             if op=='read':
                 rtxt = rtxt[:10]
-            self.log.debug('<- %s %s', op, rtxt)
+            log.debug('<- %s %s', op, rtxt)
 
-#class GpgFs(LoggingMixIn, fuse.Operations):
-class GpgFs(fuse.Operations):
+class GpgFs(LoggingMixIn, fuse.Operations):
+#class GpgFs(fuse.Operations):
 
     def __init__(self, encroot, keyid):
         '''
@@ -158,7 +159,7 @@ class GpgFs(fuse.Operations):
                               st_mtime=int(time.time()),
                               st_ctime=int(time.time()))
             self._write_index()
-            logging.info('created %s', self.index_path)
+            log.info('created %s', self.index_path)
         self.fd = 0
         self.write_path = None
         self.write_buf = []
@@ -193,7 +194,7 @@ class GpgFs(fuse.Operations):
         path = path.rsplit('/', 1)[-1]
         assert path not in dir.children
         dir.children[path] = Entry(type=ENT_FILE, path=encpath, st_size=0)
-        logging.debug('new path %s => %s', path, encpath)
+        log.debug('new path %s => %s', path, encpath)
         encdir = self.encroot + '/' + encpath[:2]
         if not os.path.exists(encdir):
             os.mkdir(encdir, 0755)
@@ -204,7 +205,7 @@ class GpgFs(fuse.Operations):
         return self.fd
 
     def flush(self, path, fh):
-        logging.debug('flush %s', path)
+        log.debug('flush %s', path)
         if not (path is not None and
                 path == self.write_path and self.write_dirty):
             return 0
@@ -316,7 +317,8 @@ if __name__ == '__main__':
     if len(sys.argv) != 4:
         sys.stderr.write('Usage: gpgfs <gpg_keyid> <encrypted_root> <mountpoint>\n')
         sys.exit(1)
-    logging.basicConfig(level=logging.DEBUG)
-    logging.getLogger('gnupg').setLevel(logging.INFO)
+    logpath = os.path.join(os.path.dirname(__file__), 'gpgfs.log')
+    log.addHandler(logging.FileHandler(logpath, 'w'))
+    log.setLevel(logging.DEBUG)
     fs = GpgFs(sys.argv[2], sys.argv[1])
     fuse.FUSE(fs, sys.argv[3], foreground=True)
