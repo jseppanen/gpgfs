@@ -3,7 +3,7 @@
 import fuse  # fusepy
 import gnupg # python-gnupg
 import zlib
-from errno import ENOENT, EACCES, ENOSYS, ENODATA
+import errno
 import stat
 from binascii import hexlify
 import os
@@ -199,7 +199,7 @@ class GpgFs(LoggingMixIn, fuse.Operations):
             os.chmod(encpath, mode)
 
     def chown(self, path, uid, gid):
-        raise fuse.FuseOSError(ENOSYS)
+        raise fuse.FuseOSError(errno.ENOSYS)
 
     def create(self, path, mode):
         encpath = hexlify(os.urandom(20))
@@ -238,7 +238,7 @@ class GpgFs(LoggingMixIn, fuse.Operations):
         try:
             ent = self._find(path)
         except KeyError:
-            raise fuse.FuseOSError(ENOENT)
+            raise fuse.FuseOSError(errno.ENOENT)
         if ent.type == ENT_DIR:
             return dict(st_mode = stat.S_IFDIR | ent.st_mode, st_size = 0,
                         st_ctime = ent.st_ctime, st_mtime = ent.st_mtime,
@@ -252,7 +252,7 @@ class GpgFs(LoggingMixIn, fuse.Operations):
                     st_ctime = s.st_ctime, st_nlink = s.st_nlink)
 
     def getxattr(self, path, name, position = 0):
-        raise fuse.FuseOSError(ENODATA) # ENOATTR
+        raise fuse.FuseOSError(errno.ENODATA) # ENOATTR
 
     def listxattr(self, path):
         return []
@@ -283,10 +283,10 @@ class GpgFs(LoggingMixIn, fuse.Operations):
         return ['.', '..'] + list(dir.children)
 
     def readlink(self, path):
-        raise fuse.FuseOSError(ENOSYS)
+        raise fuse.FuseOSError(errno.ENOSYS)
 
     def removexattr(self, path, name):
-        raise fuse.FuseOSError(ENOSYS)
+        raise fuse.FuseOSError(errno.ENOSYS)
 
     def rename(self, old, new):
         self.flush(old, 0)
@@ -303,16 +303,25 @@ class GpgFs(LoggingMixIn, fuse.Operations):
         self._write_index()
 
     def rmdir(self, path):
-        raise fuse.FuseOSError(ENOSYS)
+        parent = self._find(path, parent=True)
+        path = path.rsplit('/', 1)[-1]
+        assert path in parent.children
+        ent = parent.children[path]
+        if ent.type != ENT_DIR:
+            raise fuse.FuseOSError(errno.ENOTDIR)
+        if ent.children:
+            raise fuse.FuseOSError(errno.ENOTEMPTY)
+        del parent.children[path]
+        self._write_index()
 
     def setxattr(self, path, name, value, options, position = 0):
-        raise fuse.FuseOSError(ENOSYS)
+        raise fuse.FuseOSError(errno.ENOSYS)
 
     def statfs(self, path):
-        raise fuse.FuseOSError(ENOSYS)
+        raise fuse.FuseOSError(errno.ENOSYS)
 
     def symlink(self, target, source):
-        raise fuse.FuseOSError(ENOSYS)
+        raise fuse.FuseOSError(errno.ENOSYS)
 
     def truncate(self, path, length, fh = None):
         self.flush(path, 0)
