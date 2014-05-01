@@ -18,12 +18,17 @@ magic = 'GPGFS1\n'
 log = logging.getLogger(__name__)
 
 def decrypt(gpg, path):
-    data = file(path).read()
+    try:
+        data = file(path).read()
+    except IOError, err:
+        log.error("read failed: %s: %s", path, str(err))
+        raise FuseOSError(err.errno)
     if not data:
         return data
     res = gpg.decrypt(data)
     if not res.ok:
-        raise IOError, "decryption failed, %s" % path
+        log.error("decryption failed, %s: %s", res.status, path)
+        raise FuseOSError(errno.EIO)
     data = zlib.decompress(res.data)
     log.debug('decrypted %s' % path)
     return data
@@ -32,9 +37,19 @@ def encrypt(gpg, keyid, path, data):
     data = zlib.compress(data, 1)
     res = gpg.encrypt(data, keyid, armor=False)
     if not res.ok:
-        raise IOError, "encryption failed, keyid %s, path %s" % (keyid, path)
-    with file(path, 'w') as fd:
-        fd.write(res.data)
+        log.error("encryption failed (keyid %s), %s: %s",
+                  keyid, res.status, path)
+        raise FuseOSError(errno.EIO)
+    try:
+        with file(path+'.tmp', 'w') as fd:
+            fd.write(res.data)
+        os.rename(path+'.tmp', path)
+    except IOError, err:
+        log.error("write failed: %s: %s", path, str(err))
+        raise FuseOSError(err.errno)
+    finally:
+        try: os.remove(path+'.tmp')
+        except: pass
     log.debug('encrypted %s' % path)
 
 class Entry:
@@ -168,8 +183,8 @@ class GpgFs(LoggingMixIn, Operations):
         self.fd = 0
         self._clear_write_cache()
 
-    def _write_index(self):
-        write_index(self.gpg, self.keyid, self.index_path, self.root)
+    def _write_index(self, suffix=''):
+        write_index(self.gpg, self.keyid, self.index_path + suffix, self.root)
 
     def _find(self, path, parent=False):
         assert path.startswith('/')
@@ -199,8 +214,13 @@ class GpgFs(LoggingMixIn, Operations):
         mode &= 0777
         ent = self._find(path)
         if ent.type == ENT_DIR:
+            prev_mode = ent.st_mode
             ent.st_mode = mode
-            self._write_index()
+            try:
+                self._write_index()
+            except:
+                ent.st_mode = prev_mode
+                raise
         else:
             encpath = self.encroot + '/' + ent.path
             os.chmod(encpath, mode)
@@ -214,16 +234,24 @@ class GpgFs(LoggingMixIn, Operations):
         dir, path = self._find(path, parent=True)
         if path in dir.children:
             raise FuseOSError(errno.EEXIST)
-        dir.children[path] = Entry(type=ENT_FILE, path=encpath, st_size=0)
-        log.debug('new path %s => %s', path, encpath)
         encdir = self.encroot + '/' + encpath[:2]
         if not os.path.exists(encdir):
             os.mkdir(encdir, 0755)
         fd = os.open(self.encroot + '/' + encpath,
                      os.O_WRONLY | os.O_CREAT, mode & 0777)
         os.close(fd)
+        prev_mtime = dir.st_mtime
+        dir.children[path] = Entry(type=ENT_FILE, path=encpath, st_size=0)
+        log.debug('new path %s => %s', path, encpath)
         dir.st_mtime = int(time.time())
-        self._write_index()
+        try:
+            self._write_index()
+        except:
+            try: os.remove(self.encroot + '/' + encpath)
+            except: pass
+            del dir.children[path]
+            dir.st_mtime = prev_mtime
+            raise
         self.fd += 1
         return self.fd
 
@@ -234,10 +262,19 @@ class GpgFs(LoggingMixIn, Operations):
         ent = self._find(self.write_path)
         encpath = self.encroot + '/' + ent.path
         buf = ''.join(self.write_buf)
-        encrypt(self.gpg, self.keyid, encpath, buf)
-        ent.st_size = len(buf)
-        self._write_index()
         self.write_buf = [buf]
+        encrypt(self.gpg, self.keyid, encpath+'.new', buf)
+        prev_size = ent.st_size
+        ent.st_size = len(buf)
+        try:
+            self._write_index(suffix='.new')
+        except:
+            os.remove(encpath+'.new')
+            ent.st_size = prev_size
+            raise
+        # FIXME renames cannot fail, right?
+        os.rename(encpath+'.new', encpath)
+        os.rename(self.index_path+'.new', self.index_path)
         self.write_dirty = False
         log.debug('flushed %d bytes to %s', len(buf), self.write_path)
         return 0
@@ -266,12 +303,18 @@ class GpgFs(LoggingMixIn, Operations):
         dir, path = self._find(path, parent=True)
         if path in dir.children:
             raise FuseOSError(errno.EEXIST)
+        prev_mtime = dir.st_mtime
         dir.children[path] = Entry(type=ENT_DIR, children={},
                                    st_mode=(mode & 0777),
                                    st_mtime=int(time.time()),
                                    st_ctime=int(time.time()))
         dir.st_mtime = int(time.time())
-        self._write_index()
+        try:
+            self._write_index()
+        except:
+            del dir.children[path]
+            dir.st_mtime = prev_mtime
+            raise
 
     def open(self, path, flags):
         return 0
@@ -301,15 +344,24 @@ class GpgFs(LoggingMixIn, Operations):
         if old_name not in old_dir.children:
             raise FuseOSError(errno.ENOENT)
         new_dir, new_name = self._find(new, parent=True)
-        if new_name in new_dir.children:
-            ent = new_dir.children[new_name]
-            if ent.type == ENT_FILE:
-                os.remove(self.encroot + '/' + ent.path)
-            elif ent.children:
-                raise FuseOSError(errno.ENOTEMPTY)
+        prev_ent = new_dir.children.get(new_name)
+        if prev_ent and prev_ent.type == ENT_DIR and prev_ent.children:
+            raise FuseOSError(errno.ENOTEMPTY)
+        prev_old_mtime = old_dir.st_mtime
+        prev_new_mtime = new_dir.st_mtime
         new_dir.children[new_name] = old_dir.children.pop(old_name)
         old_dir.st_mtime = new_dir.st_mtime = int(time.time())
-        self._write_index()
+        try:
+            self._write_index()
+        except:
+            old_dir.children[old_name] = new_dir.children.pop(new_name)
+            if prev_ent:
+                new_dir.children[new_name] = prev_ent
+            old_dir.st_mtime = prev_old_mtime
+            new_dir.st_mtime = prev_new_mtime
+            raise
+        if prev_ent and prev_ent.type == ENT_FILE:
+            os.remove(self.encroot + '/' + prev_ent.path)
 
     def rmdir(self, path):
         parent, path = self._find(path, parent=True)
@@ -320,9 +372,15 @@ class GpgFs(LoggingMixIn, Operations):
             raise FuseOSError(errno.ENOTDIR)
         if ent.children:
             raise FuseOSError(errno.ENOTEMPTY)
+        prev_mtime = parent.st_mtime
         del parent.children[path]
         parent.st_mtime = int(time.time())
-        self._write_index()
+        try:
+            self._write_index()
+        except:
+            parent.children[path] = ent
+            parent.st_mtime = prev_mtime
+            raise
 
     def setxattr(self, path, name, value, options, position = 0):
         raise FuseOSError(errno.ENOSYS)
@@ -339,14 +397,23 @@ class GpgFs(LoggingMixIn, Operations):
         ent = self._find(path)
         encpath = self.encroot + '/' + ent.path
         if length == 0:
-            with open(encpath, 'r+') as f:
-                f.truncate(0)
+            with open(encpath+'.new', 'w') as f:
+                pass
         else:
             buf = decrypt(self.gpg, encpath)
             buf = buf[:length]
-            encrypt(self.gpg, self.keyid, encpath, buf)
+            encrypt(self.gpg, self.keyid, encpath+'.new', buf)
+        prev_size = ent.st_size
         ent.st_size = length
-        self._write_index()
+        try:
+            self._write_index(suffix='.new')
+        except:
+            ent.st_size = prev_size
+            os.remove(encpath+'.new')
+            raise
+        # FIXME renames cannot fail, right?
+        os.rename(encpath+'.new', encpath)
+        os.rename(self.index_path+'.new', self.index_path)
 
     def unlink(self, path):
         if self.write_path == path:
@@ -355,20 +422,32 @@ class GpgFs(LoggingMixIn, Operations):
         dir, name = self._find(path, parent=True)
         if name not in dir.children:
             raise FuseOSError(errno.ENOENT)
-        encpath = self.encroot + '/' + dir.children[name].path
-        os.remove(encpath)
+        ent = dir.children[name]
+        encpath = self.encroot + '/' + ent.path
         del dir.children[name]
+        prev_mtime = dir.st_mtime
         dir.st_mtime = int(time.time())
-        self._write_index()
+        try:
+            self._write_index()
+        except:
+            dir.children[name] = ent
+            dir.st_mtime = prev_mtime
+            raise
+        os.remove(encpath)
 
     def utimens(self, path, times = None):
         ent = self._find(path)
         if ent.type == ENT_DIR:
+            prev_mtime = ent.st_mtime
             if times is None:
                 ent.st_mtime = int(time.time())
             else:
                 ent.st_mtime = times[1]
-            self._write_index()
+            try:
+                self._write_index()
+            except:
+                ent.st_mtime = prev_mtime
+                raise
         else:
             # flush may mess with mtime
             self.flush(path, 0)
