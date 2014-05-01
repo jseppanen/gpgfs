@@ -222,6 +222,7 @@ class GpgFs(LoggingMixIn, Operations):
         fd = os.open(self.encroot + '/' + encpath,
                      os.O_WRONLY | os.O_CREAT, mode & 0777)
         os.close(fd)
+        dir.st_mtime = int(time.time())
         self._write_index()
         self.fd += 1
         return self.fd
@@ -269,6 +270,7 @@ class GpgFs(LoggingMixIn, Operations):
                                    st_mode=(mode & 0777),
                                    st_mtime=int(time.time()),
                                    st_ctime=int(time.time()))
+        dir.st_mtime = int(time.time())
         self._write_index()
 
     def open(self, path, flags):
@@ -306,6 +308,7 @@ class GpgFs(LoggingMixIn, Operations):
             elif ent.children:
                 raise FuseOSError(errno.ENOTEMPTY)
         new_dir.children[new_name] = old_dir.children.pop(old_name)
+        old_dir.st_mtime = new_dir.st_mtime = int(time.time())
         self._write_index()
 
     def rmdir(self, path):
@@ -318,6 +321,7 @@ class GpgFs(LoggingMixIn, Operations):
         if ent.children:
             raise FuseOSError(errno.ENOTEMPTY)
         del parent.children[path]
+        parent.st_mtime = int(time.time())
         self._write_index()
 
     def setxattr(self, path, name, value, options, position = 0):
@@ -354,6 +358,7 @@ class GpgFs(LoggingMixIn, Operations):
         encpath = self.encroot + '/' + dir.children[name].path
         os.remove(encpath)
         del dir.children[name]
+        dir.st_mtime = int(time.time())
         self._write_index()
 
     def utimens(self, path, times = None):
