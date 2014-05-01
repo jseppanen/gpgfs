@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import fuse  # fusepy
+from fuse import FUSE, FuseOSError, Operations
 import gnupg # python-gnupg
 import zlib
 import errno
@@ -142,18 +142,20 @@ class LoggingMixIn:
                 rtxt = rtxt[:10]
             log.debug('<- %s %s', op, rtxt)
 
-class GpgFs(LoggingMixIn, fuse.Operations):
-#class GpgFs(fuse.Operations):
+class GpgFs(LoggingMixIn, Operations):
+#class GpgFs(Operations):
 
     def __init__(self, encroot, keyid):
         '''
         :param encroot: Encrypted root directory
         '''
-        self.encroot = encroot
+        self.encroot = encroot.rstrip('/')
+        assert os.path.exists(self.encroot)
+        assert os.path.isdir(self.encroot)
         self.keyid = keyid
         #self.cache = cache
         self.gpg = gnupg.GPG()
-        self.index_path = encroot + '/index'
+        self.index_path = self.encroot + '/index'
         if os.path.exists(self.index_path):
             self.root = read_index(self.gpg, self.index_path)
         else:
@@ -176,9 +178,14 @@ class GpgFs(LoggingMixIn, fuse.Operations):
         node = self.root
         path = path[1:].split('/')
         if parent:
+            basename = path[-1]
             path = path[:-1]
         for name in path:
+            if name not in node.children:
+                raise FuseOSError(errno.ENOENT)
             node = node.children[name]
+        if parent:
+            return node, basename
         return node
 
     def _clear_write_cache(self):
@@ -199,14 +206,14 @@ class GpgFs(LoggingMixIn, fuse.Operations):
             os.chmod(encpath, mode)
 
     def chown(self, path, uid, gid):
-        raise fuse.FuseOSError(errno.ENOSYS)
+        raise FuseOSError(errno.ENOSYS)
 
     def create(self, path, mode):
         encpath = hexlify(os.urandom(20))
         encpath = encpath[:2] + '/' + encpath[2:]
-        dir = self._find(path, parent=True)
-        path = path.rsplit('/', 1)[-1]
-        assert path not in dir.children
+        dir, path = self._find(path, parent=True)
+        if path in dir.children:
+            raise FuseOSError(errno.EEXIST)
         dir.children[path] = Entry(type=ENT_FILE, path=encpath, st_size=0)
         log.debug('new path %s => %s', path, encpath)
         encdir = self.encroot + '/' + encpath[:2]
@@ -235,10 +242,7 @@ class GpgFs(LoggingMixIn, fuse.Operations):
         return 0
 
     def getattr(self, path, fh = None):
-        try:
-            ent = self._find(path)
-        except KeyError:
-            raise fuse.FuseOSError(errno.ENOENT)
+        ent = self._find(path)
         if ent.type == ENT_DIR:
             return dict(st_mode = stat.S_IFDIR | ent.st_mode, st_size = 0,
                         st_ctime = ent.st_ctime, st_mtime = ent.st_mtime,
@@ -252,15 +256,15 @@ class GpgFs(LoggingMixIn, fuse.Operations):
                     st_ctime = s.st_ctime, st_nlink = s.st_nlink)
 
     def getxattr(self, path, name, position = 0):
-        raise fuse.FuseOSError(errno.ENODATA) # ENOATTR
+        raise FuseOSError(errno.ENODATA) # ENOATTR
 
     def listxattr(self, path):
         return []
 
     def mkdir(self, path, mode):
-        dir = self._find(path, parent=True)
-        path = path.rsplit('/', 1)[-1]
-        assert path not in dir.children
+        dir, path = self._find(path, parent=True)
+        if path in dir.children:
+            raise FuseOSError(errno.EEXIST)
         dir.children[path] = Entry(type=ENT_DIR, children={},
                                    st_mode=(mode & 0777),
                                    st_mtime=int(time.time()),
@@ -283,45 +287,47 @@ class GpgFs(LoggingMixIn, fuse.Operations):
         return ['.', '..'] + list(dir.children)
 
     def readlink(self, path):
-        raise fuse.FuseOSError(errno.ENOSYS)
+        raise FuseOSError(errno.ENOSYS)
 
     def removexattr(self, path, name):
-        raise fuse.FuseOSError(errno.ENOSYS)
+        raise FuseOSError(errno.ENOSYS)
 
     def rename(self, old, new):
         self.flush(old, 0)
         self._clear_write_cache()
-        old_dir = self._find(old, parent=True)
-        old_name = old.rsplit('/', 1)[-1]
-        new_dir = self._find(new, parent=True)
-        new_name = new.rsplit('/', 1)[-1]
+        old_dir, old_name = self._find(old, parent=True)
+        if old_name not in old_dir.children:
+            raise FuseOSError(errno.ENOENT)
+        new_dir, new_name = self._find(new, parent=True)
         if new_name in new_dir.children:
             ent = new_dir.children[new_name]
             if ent.type == ENT_FILE:
                 os.remove(self.encroot + '/' + ent.path)
+            elif ent.children:
+                raise FuseOSError(errno.ENOTEMPTY)
         new_dir.children[new_name] = old_dir.children.pop(old_name)
         self._write_index()
 
     def rmdir(self, path):
-        parent = self._find(path, parent=True)
-        path = path.rsplit('/', 1)[-1]
-        assert path in parent.children
+        parent, path = self._find(path, parent=True)
+        if path not in parent.children:
+            raise FuseOSError(errno.ENOENT)
         ent = parent.children[path]
         if ent.type != ENT_DIR:
-            raise fuse.FuseOSError(errno.ENOTDIR)
+            raise FuseOSError(errno.ENOTDIR)
         if ent.children:
-            raise fuse.FuseOSError(errno.ENOTEMPTY)
+            raise FuseOSError(errno.ENOTEMPTY)
         del parent.children[path]
         self._write_index()
 
     def setxattr(self, path, name, value, options, position = 0):
-        raise fuse.FuseOSError(errno.ENOSYS)
+        raise FuseOSError(errno.ENOSYS)
 
     def statfs(self, path):
-        raise fuse.FuseOSError(errno.ENOSYS)
+        raise FuseOSError(errno.ENOSYS)
 
     def symlink(self, target, source):
-        raise fuse.FuseOSError(errno.ENOSYS)
+        raise FuseOSError(errno.ENOSYS)
 
     def truncate(self, path, length, fh = None):
         self.flush(path, 0)
@@ -342,8 +348,9 @@ class GpgFs(LoggingMixIn, fuse.Operations):
         if self.write_path == path:
             # no need to flush afterwards
             self._clear_write_cache()
-        dir = self._find(path, parent=True)
-        name = path.rsplit('/', 1)[-1]
+        dir, name = self._find(path, parent=True)
+        if name not in dir.children:
+            raise FuseOSError(errno.ENOENT)
         encpath = self.encroot + '/' + dir.children[name].path
         os.remove(encpath)
         del dir.children[name]
@@ -391,4 +398,4 @@ if __name__ == '__main__':
     log.addHandler(logging.FileHandler(logpath, 'w'))
     log.setLevel(logging.DEBUG)
     fs = GpgFs(sys.argv[2], sys.argv[1])
-    fuse.FUSE(fs, sys.argv[3], foreground=True)
+    FUSE(fs, sys.argv[3], foreground=True)
