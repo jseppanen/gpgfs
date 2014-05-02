@@ -282,7 +282,8 @@ class GpgFs(LoggingMixIn, Operations):
     def getattr(self, path, fh = None):
         ent = self._find(path)
         if ent.type == ENT_DIR:
-            return dict(st_mode = stat.S_IFDIR | ent.st_mode, st_size = 0,
+            return dict(st_mode = stat.S_IFDIR | ent.st_mode,
+                        st_size = len(ent.children),
                         st_ctime = ent.st_ctime, st_mtime = ent.st_mtime,
                         st_atime = 0, st_nlink = 3)
         # ensure st_size is up-to-date
@@ -405,7 +406,7 @@ class GpgFs(LoggingMixIn, Operations):
         ent = self._find(path)
         encpath = self.encroot + '/' + ent.path
         if length == 0:
-            with open(encpath+'.new', 'w') as f:
+            with open(encpath+'.new', 'w'):
                 pass
         else:
             buf = decrypt(self.gpg, encpath)
