@@ -340,13 +340,21 @@ class GpgFs(LoggingMixIn, Operations):
     def rename(self, old, new):
         self.flush(old, 0)
         self._clear_write_cache()
+        if new.startswith(old):
+            raise FuseOSError(errno.EINVAL)
         old_dir, old_name = self._find(old, parent=True)
         if old_name not in old_dir.children:
             raise FuseOSError(errno.ENOENT)
         new_dir, new_name = self._find(new, parent=True)
         prev_ent = new_dir.children.get(new_name)
-        if prev_ent and prev_ent.type == ENT_DIR and prev_ent.children:
-            raise FuseOSError(errno.ENOTEMPTY)
+        if prev_ent:
+            if prev_ent.type == ENT_DIR:
+                if old_dir[old_name].type != ENT_DIR:
+                    raise FuseOSError(errno.EISDIR)
+                if prev_ent.children:
+                    raise FuseOSError(errno.ENOTEMPTY)
+            elif old_dir[old_name].type == ENT_DIR:
+                raise FuseOSError(errno.ENOTDIR)
         prev_old_mtime = old_dir.st_mtime
         prev_new_mtime = new_dir.st_mtime
         new_dir.children[new_name] = old_dir.children.pop(old_name)
