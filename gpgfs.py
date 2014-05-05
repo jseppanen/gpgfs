@@ -1,56 +1,19 @@
 #!/usr/bin/env python
 
 from fuse import FUSE, FuseOSError, Operations
-import gnupg # python-gnupg
-import zlib
 import errno
 import stat
-from binascii import hexlify
 import os
 import sys
 import logging
 import struct
 import time
 from cStringIO import StringIO
+import gpgstore
 
 magic = 'GPGFS1\n'
 
-log = logging.getLogger(__name__)
-
-def decrypt(gpg, path):
-    try:
-        data = file(path).read()
-    except IOError, err:
-        log.error("read failed: %s: %s", path, str(err))
-        raise FuseOSError(err.errno)
-    if not data:
-        return data
-    res = gpg.decrypt(data)
-    if not res.ok:
-        log.error("decryption failed, %s: %s", res.status, path)
-        raise FuseOSError(errno.EIO)
-    data = zlib.decompress(res.data)
-    log.debug('decrypted %s' % path)
-    return data
-
-def encrypt(gpg, keyid, path, data):
-    data = zlib.compress(data, 1)
-    res = gpg.encrypt(data, keyid, armor=False)
-    if not res.ok:
-        log.error("encryption failed (keyid %s), %s: %s",
-                  keyid, res.status, path)
-        raise FuseOSError(errno.EIO)
-    try:
-        with file(path+'.tmp', 'w') as fd:
-            fd.write(res.data)
-        os.rename(path+'.tmp', path)
-    except IOError, err:
-        log.error("write failed: %s: %s", path, str(err))
-        raise FuseOSError(err.errno)
-    finally:
-        try: os.remove(path+'.tmp')
-        except: pass
-    log.debug('encrypted %s' % path)
+log = logging.getLogger('gpgfs')
 
 class Entry:
     '''
@@ -64,8 +27,8 @@ class Entry:
 ENT_FILE = 0
 ENT_DIR = 1
 
-def read_index(gpg, path):
-    data = decrypt(gpg, path)
+def read_index(store, path):
+    data = store.get(path)
     buf = StringIO(data)
     if buf.read(len(magic)) != magic:
         raise IOError, 'index parse error: %s' % path
@@ -73,13 +36,13 @@ def read_index(gpg, path):
     root = Entry(**read_dict(buf))
     return root
 
-def write_index(gpg, keyid, path, root):
+def write_index(store, path, root):
     buf = StringIO()
     buf.write(magic)
     header = ''
     write_atom(buf, header)
     write_dict(buf, root)
-    encrypt(gpg, keyid, path, buf.getvalue())
+    store.put(buf.getvalue(), path=path)
 
 def write_dict(fd, dct):
     # breadth-first
@@ -167,12 +130,11 @@ class GpgFs(LoggingMixIn, Operations):
         self.encroot = encroot.rstrip('/')
         assert os.path.exists(self.encroot)
         assert os.path.isdir(self.encroot)
-        self.keyid = keyid
         #self.cache = cache
-        self.gpg = gnupg.GPG()
-        self.index_path = self.encroot + '/index'
-        if os.path.exists(self.index_path):
-            self.root = read_index(self.gpg, self.index_path)
+        self.store = gpgstore.GpgStore(self.encroot, keyid)
+        self.index_path = 'index'
+        if os.path.exists(self.encroot + '/' + self.index_path):
+            self.root = read_index(self.store, self.index_path)
         else:
             self.root = Entry(type=ENT_DIR, children={},
                               st_mode=0755,
@@ -183,8 +145,8 @@ class GpgFs(LoggingMixIn, Operations):
         self.fd = 0
         self._clear_write_cache()
 
-    def _write_index(self, suffix=''):
-        write_index(self.gpg, self.keyid, self.index_path + suffix, self.root)
+    def _write_index(self):
+        write_index(self.store, self.index_path, self.root)
 
     def _find(self, path, parent=False):
         assert path.startswith('/')
@@ -229,17 +191,11 @@ class GpgFs(LoggingMixIn, Operations):
         raise FuseOSError(errno.ENOSYS)
 
     def create(self, path, mode):
-        encpath = hexlify(os.urandom(20))
-        encpath = encpath[:2] + '/' + encpath[2:]
         dir, path = self._find(path, parent=True)
         if path in dir.children:
             raise FuseOSError(errno.EEXIST)
-        encdir = self.encroot + '/' + encpath[:2]
-        if not os.path.exists(encdir):
-            os.mkdir(encdir, 0755)
-        fd = os.open(self.encroot + '/' + encpath,
-                     os.O_WRONLY | os.O_CREAT, mode & 0777)
-        os.close(fd)
+        # FIXME mode
+        encpath = self.store.put('')
         prev_mtime = dir.st_mtime
         dir.children[path] = Entry(type=ENT_FILE, path=encpath, st_size=0)
         log.debug('new path %s => %s', path, encpath)
@@ -247,7 +203,7 @@ class GpgFs(LoggingMixIn, Operations):
         try:
             self._write_index()
         except:
-            try: os.remove(self.encroot + '/' + encpath)
+            try: self.store.delete(encpath)
             except: pass
             del dir.children[path]
             dir.st_mtime = prev_mtime
@@ -259,24 +215,27 @@ class GpgFs(LoggingMixIn, Operations):
         if not self.write_dirty:
             log.debug('nothing to flush')
             return 0
-        ent = self._find(self.write_path)
-        encpath = self.encroot + '/' + ent.path
         buf = ''.join(self.write_buf)
         self.write_buf = [buf]
-        encrypt(self.gpg, self.keyid, encpath+'.new', buf)
+        ent = self._find(self.write_path)
         prev_size = ent.st_size
+        prev_path = ent.path
         ent.st_size = len(buf)
+        ent.path = self.store.put(buf)
         try:
-            self._write_index(suffix='.new')
+            self._write_index()
         except:
-            os.remove(encpath+'.new')
+            self.store.delete(ent.path)
             ent.st_size = prev_size
+            ent.path = prev_path
             raise
-        # FIXME renames cannot fail, right?
-        os.rename(encpath+'.new', encpath)
-        os.rename(self.index_path+'.new', self.index_path)
+        self.store.delete(prev_path)
         self.write_dirty = False
         log.debug('flushed %d bytes to %s', len(buf), self.write_path)
+        return 0
+
+    def fsync(self, path, datasync, fh):
+        self.flush(path, fh)
         return 0
 
     def getattr(self, path, fh = None):
@@ -324,8 +283,7 @@ class GpgFs(LoggingMixIn, Operations):
         self.flush(path, 0)
         ent = self._find(path)
         assert ent.type == ENT_FILE
-        encpath = self.encroot + '/' + ent.path
-        data = decrypt(self.gpg, encpath)
+        data = self.store.get(ent.path)
         return data[offset:offset + size]
 
     def readdir(self, path, fh):
@@ -404,25 +362,23 @@ class GpgFs(LoggingMixIn, Operations):
         self.flush(path, 0)
         self._clear_write_cache()
         ent = self._find(path)
-        encpath = self.encroot + '/' + ent.path
         if length == 0:
-            with open(encpath+'.new', 'w'):
-                pass
+            buf = ''
         else:
-            buf = decrypt(self.gpg, encpath)
+            buf = self.store.get(ent.path)
             buf = buf[:length]
-            encrypt(self.gpg, self.keyid, encpath+'.new', buf)
         prev_size = ent.st_size
+        prev_path = ent.path
         ent.st_size = length
+        ent.path = self.store.put(buf)
         try:
-            self._write_index(suffix='.new')
+            self._write_index()
         except:
+            os.remove(ent.path)
             ent.st_size = prev_size
-            os.remove(encpath+'.new')
+            ent.path = prev_path
             raise
-        # FIXME renames cannot fail, right?
-        os.rename(encpath+'.new', encpath)
-        os.rename(self.index_path+'.new', self.index_path)
+        self.store.delete(prev_path)
 
     def unlink(self, path):
         if self.write_path == path:
@@ -465,10 +421,9 @@ class GpgFs(LoggingMixIn, Operations):
 
     def write(self, path, data, offset, fh):
         ent = self._find(path)
-        encpath = self.encroot + '/' + ent.path
         if path != self.write_path:
             self.flush(self.write_path, None)
-            buf = decrypt(self.gpg, encpath)
+            buf = self.store.get(ent.path)
             self.write_buf = [buf]
             self.write_len = len(buf)
         self.write_path = path
