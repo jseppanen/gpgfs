@@ -60,3 +60,6 @@ class GpgStore(object):
     def delete(self, path):
         os.remove(self.encroot + '/' + path)
         log.debug('deleted %s' % path)
+
+    def exists(self, path):
+        return os.path.exists(self.encroot + '/' + path)
