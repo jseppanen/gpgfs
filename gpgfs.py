@@ -10,6 +10,8 @@ import struct
 import time
 from cStringIO import StringIO
 import gpgstore
+from contextlib import contextmanager
+from threading import Lock
 
 magic = 'GPGFS1\n'
 
@@ -23,11 +25,15 @@ class Entry:
         for k,v in kwargs.iteritems():
             setattr(self, k, v)
 
-# entry types:
-ENT_FILE = 0
-ENT_DIR = 1
-
 def read_index(store, path):
+    if not store.exists(path):
+        now = time.time()
+        root = Entry(children={}, nlink=3, size=0,
+                     mode=stat.S_IFDIR | 0755,
+                     mtime=now, ctime=now)
+        write_index(store, path, root)
+        log.info('created %s', path)
+        return root
     data = store.get(path)
     buf = StringIO(data)
     if buf.read(len(magic)) != magic:
@@ -60,13 +66,20 @@ def write_dict(fd, dct):
             buf.write('E')
             children.append(val)
         elif isinstance(val, (int, long)):
-            buf.write('I')
-            buf.write(struct.pack('<I', val))
+            if val < 2**32:
+                buf.write('I')
+                buf.write(struct.pack('<I', val))
+            else:
+                buf.write('L')
+                buf.write(struct.pack('<Q', val))
+        elif isinstance(val, float):
+            buf.write('F')
+            buf.write(struct.pack('<d', val))
         elif isinstance(val, str):
-            buf.write('S')
+            buf.write('B')
             write_atom(buf, val)
         elif isinstance(val, unicode):
-            buf.write('U')
+            buf.write('S')
             write_atom(buf, val.encode('utf8'))
         else:
             raise TypeError, type(val)
@@ -85,8 +98,10 @@ def read_dict(fd):
         if tag == 'D':    val = read_dict(fd)
         elif tag == 'E':  val = Entry(**read_dict(fd))
         elif tag == 'I':  val = struct.unpack('<I', buf.read(4))[0]
-        elif tag == 'S':  val = read_atom(buf)
-        elif tag == 'U':  val = read_atom(buf).decode('utf8')
+        elif tag == 'L':  val = struct.unpack('<Q', buf.read(8))[0]
+        elif tag == 'F':  val = struct.unpack('<d', buf.read(8))[0]
+        elif tag == 'B':  val = read_atom(buf)
+        elif tag == 'S':  val = read_atom(buf).decode('utf8')
         else:             raise TypeError, tag
         dct[key] = val
     return dct
@@ -114,6 +129,9 @@ class LoggingMixIn:
         except OSError, e:
             ret = str(e)
             raise
+        except:
+            log.exception('unhandled error in %s:', op)
+            raise
         finally:
             rtxt = repr(ret)
             if op=='read':
@@ -133,15 +151,8 @@ class GpgFs(LoggingMixIn, Operations):
         #self.cache = cache
         self.store = gpgstore.GpgStore(self.encroot, keyid)
         self.index_path = 'index'
-        if os.path.exists(self.encroot + '/' + self.index_path):
-            self.root = read_index(self.store, self.index_path)
-        else:
-            self.root = Entry(type=ENT_DIR, children={},
-                              st_mode=0755,
-                              st_mtime=int(time.time()),
-                              st_ctime=int(time.time()))
-            self._write_index()
-            log.info('created %s', self.index_path)
+        self.root = read_index(self.store, self.index_path)
+        self.txlock = Lock()
         self.fd = 0
         self._clear_write_cache()
 
@@ -171,87 +182,83 @@ class GpgFs(LoggingMixIn, Operations):
         self.write_len = 0
         self.write_dirty = False
 
+    @contextmanager
+    def transaction(self):
+        paths = {'old': None, 'new': None}
+        def putx(data, old_path = None):
+            paths['new'] = self.store.put(data)
+            paths['old'] = old_path
+            return paths['new']
+        with self.txlock:
+            try:
+                yield putx
+                # commit
+                write_index(self.store, self.index_path, self.root)
+                if paths['old']:
+                    self.store.delete(paths['old'])
+            except:
+                # rollback
+                try:
+                    log.warning('starting rollback')
+                    self.root = read_index(self.store, self.index_path)
+                    if paths['new']:
+                        self.store.delete(paths['new'])
+                    log.warning('rollback done')
+                except:
+                    log.exception('rollback failed')
+                raise
+
     def chmod(self, path, mode):
         # sanitize mode (clear setuid/gid/sticky bits)
         mode &= 0777
-        ent = self._find(path)
-        if ent.type == ENT_DIR:
-            prev_mode = ent.st_mode
-            ent.st_mode = mode
-            try:
-                self._write_index()
-            except:
-                ent.st_mode = prev_mode
-                raise
-        else:
-            encpath = self.encroot + '/' + ent.path
-            os.chmod(encpath, mode)
+        with self.transaction():
+            ent = self._find(path)
+            ent.mode = mode | (ent.mode & 0170000)
 
     def chown(self, path, uid, gid):
         raise FuseOSError(errno.ENOSYS)
 
     def create(self, path, mode):
-        dir, path = self._find(path, parent=True)
-        if path in dir.children:
-            raise FuseOSError(errno.EEXIST)
-        # FIXME mode
-        encpath = self.store.put('')
-        prev_mtime = dir.st_mtime
-        dir.children[path] = Entry(type=ENT_FILE, path=encpath, st_size=0)
-        log.debug('new path %s => %s', path, encpath)
-        dir.st_mtime = int(time.time())
-        try:
-            self._write_index()
-        except:
-            try: self.store.delete(encpath)
-            except: pass
-            del dir.children[path]
-            dir.st_mtime = prev_mtime
-            raise
-        self.fd += 1
-        return self.fd
+        mode &= 0777
+        mode |= stat.S_IFREG
+        with self.transaction() as putx:
+            parent, name = self._find(path, parent=True)
+            if name in parent.children:
+                raise FuseOSError(errno.EEXIST)
+            now = time.time()
+            encpath = putx('')
+            parent.children[name] = Entry(mode=mode, encpath=encpath, size=0,
+                                          nlink=1, ctime=now, mtime=now)
+            parent.mtime = now
+            log.debug('new path %s => %s', path, encpath)
+            self.fd += 1
+            return self.fd
 
     def flush(self, path, fh):
         if not self.write_dirty:
             log.debug('nothing to flush')
             return 0
-        buf = ''.join(self.write_buf)
-        self.write_buf = [buf]
-        ent = self._find(self.write_path)
-        prev_size = ent.st_size
-        prev_path = ent.path
-        ent.st_size = len(buf)
-        ent.path = self.store.put(buf)
-        try:
-            self._write_index()
-        except:
-            self.store.delete(ent.path)
-            ent.st_size = prev_size
-            ent.path = prev_path
-            raise
-        self.store.delete(prev_path)
-        self.write_dirty = False
-        log.debug('flushed %d bytes to %s', len(buf), self.write_path)
-        return 0
+        with self.transaction() as putx:
+            buf = ''.join(self.write_buf)
+            self.write_buf = [buf]
+            ent = self._find(self.write_path)
+            ent.size = len(buf)
+            ent.encpath = putx(buf, ent.encpath)
+            self.write_dirty = False
+            log.debug('flushed %d bytes to %s', len(buf), self.write_path)
+            return 0
 
     def fsync(self, path, datasync, fh):
         self.flush(path, fh)
         return 0
 
     def getattr(self, path, fh = None):
-        ent = self._find(path)
-        if ent.type == ENT_DIR:
-            return dict(st_mode = stat.S_IFDIR | ent.st_mode,
-                        st_size = len(ent.children),
-                        st_ctime = ent.st_ctime, st_mtime = ent.st_mtime,
-                        st_atime = 0, st_nlink = 3)
-        # ensure st_size is up-to-date
-        self.flush(path, 0)
-        encpath = self.encroot + '/' + ent.path
-        s = os.stat(encpath)
-        return dict(st_mode = s.st_mode, st_size = ent.st_size,
-                    st_atime = s.st_atime, st_mtime = s.st_mtime,
-                    st_ctime = s.st_ctime, st_nlink = s.st_nlink)
+        # don't do full blown transaction
+        with self.txlock:
+            ent = self._find(path)
+            return dict(st_mode = ent.mode, st_size = ent.size,
+                        st_ctime = ent.ctime, st_mtime = ent.mtime,
+                        st_atime = 0, st_nlink = ent.nlink)
 
     def getxattr(self, path, name, position = 0):
         raise FuseOSError(errno.ENODATA) # ENOATTR
@@ -260,21 +267,16 @@ class GpgFs(LoggingMixIn, Operations):
         return []
 
     def mkdir(self, path, mode):
-        dir, path = self._find(path, parent=True)
-        if path in dir.children:
-            raise FuseOSError(errno.EEXIST)
-        prev_mtime = dir.st_mtime
-        dir.children[path] = Entry(type=ENT_DIR, children={},
-                                   st_mode=(mode & 0777),
-                                   st_mtime=int(time.time()),
-                                   st_ctime=int(time.time()))
-        dir.st_mtime = int(time.time())
-        try:
-            self._write_index()
-        except:
-            del dir.children[path]
-            dir.st_mtime = prev_mtime
-            raise
+        mode &= 0777
+        mode |= stat.S_IFDIR
+        with self.transaction():
+            parent, name = self._find(path, parent=True)
+            if name in parent.children:
+                raise FuseOSError(errno.EEXIST)
+            now = time.time()
+            parent.children[name] = Entry(children={}, mode=mode, nlink=2,
+                                          size=0, mtime=now, ctime=now)
+            parent.mtime = now
 
     def open(self, path, flags):
         return 0
@@ -282,13 +284,13 @@ class GpgFs(LoggingMixIn, Operations):
     def read(self, path, size, offset, fh):
         self.flush(path, 0)
         ent = self._find(path)
-        assert ent.type == ENT_FILE
-        data = self.store.get(ent.path)
+        assert ent.mode & stat.S_IFREG
+        data = self.store.get(ent.encpath)
         return data[offset:offset + size]
 
     def readdir(self, path, fh):
-        dir = self._find(path)
-        return ['.', '..'] + list(dir.children)
+        dirent = self._find(path)
+        return ['.', '..'] + list(dirent.children)
 
     def readlink(self, path):
         raise FuseOSError(errno.ENOSYS)
@@ -301,53 +303,38 @@ class GpgFs(LoggingMixIn, Operations):
         self._clear_write_cache()
         if new.startswith(old):
             raise FuseOSError(errno.EINVAL)
-        old_dir, old_name = self._find(old, parent=True)
-        if old_name not in old_dir.children:
-            raise FuseOSError(errno.ENOENT)
-        new_dir, new_name = self._find(new, parent=True)
-        prev_ent = new_dir.children.get(new_name)
-        if prev_ent:
-            if prev_ent.type == ENT_DIR:
-                if old_dir[old_name].type != ENT_DIR:
-                    raise FuseOSError(errno.EISDIR)
-                if prev_ent.children:
-                    raise FuseOSError(errno.ENOTEMPTY)
-            elif old_dir[old_name].type == ENT_DIR:
-                raise FuseOSError(errno.ENOTDIR)
-        prev_old_mtime = old_dir.st_mtime
-        prev_new_mtime = new_dir.st_mtime
-        new_dir.children[new_name] = old_dir.children.pop(old_name)
-        old_dir.st_mtime = new_dir.st_mtime = int(time.time())
-        try:
-            self._write_index()
-        except:
-            old_dir.children[old_name] = new_dir.children.pop(new_name)
-            if prev_ent:
-                new_dir.children[new_name] = prev_ent
-            old_dir.st_mtime = prev_old_mtime
-            new_dir.st_mtime = prev_new_mtime
-            raise
-        if prev_ent and prev_ent.type == ENT_FILE:
-            os.remove(self.encroot + '/' + prev_ent.path)
+        with self.transaction():
+            old_dir, old_name = self._find(old, parent=True)
+            if old_name not in old_dir.children:
+                raise FuseOSError(errno.ENOENT)
+            new_dir, new_name = self._find(new, parent=True)
+            old_ent = old_dir.children[old_name]
+            new_ent = new_dir.children.get(new_name)
+            if new_ent:
+                if new_ent.mode & stat.S_IFDIR:
+                    if not old_ent.mode & stat.S_IFDIR:
+                        raise FuseOSError(errno.EISDIR)
+                    if new_ent.children:
+                        raise FuseOSError(errno.ENOTEMPTY)
+                elif old_ent.mode & stat.S_IFDIR:
+                    raise FuseOSError(errno.ENOTDIR)
+            new_dir.children[new_name] = old_dir.children.pop(old_name)
+            old_dir.mtime = new_dir.mtime = time.time()
+        if new_ent != None and new_ent.mode & stat.S_IFREG:
+            self.store.delete(new_ent.encpath)
 
     def rmdir(self, path):
-        parent, path = self._find(path, parent=True)
-        if path not in parent.children:
-            raise FuseOSError(errno.ENOENT)
-        ent = parent.children[path]
-        if ent.type != ENT_DIR:
-            raise FuseOSError(errno.ENOTDIR)
-        if ent.children:
-            raise FuseOSError(errno.ENOTEMPTY)
-        prev_mtime = parent.st_mtime
-        del parent.children[path]
-        parent.st_mtime = int(time.time())
-        try:
-            self._write_index()
-        except:
-            parent.children[path] = ent
-            parent.st_mtime = prev_mtime
-            raise
+        with self.transaction():
+            parent, name = self._find(path, parent=True)
+            if name not in parent.children:
+                raise FuseOSError(errno.ENOENT)
+            ent = parent.children[name]
+            if not ent.mode & stat.S_IFDIR:
+                raise FuseOSError(errno.ENOTDIR)
+            if ent.children:
+                raise FuseOSError(errno.ENOTEMPTY)
+            del parent.children[name]
+            parent.mtime = time.time()
 
     def setxattr(self, path, name, value, options, position = 0):
         raise FuseOSError(errno.ENOSYS)
@@ -361,69 +348,42 @@ class GpgFs(LoggingMixIn, Operations):
     def truncate(self, path, length, fh = None):
         self.flush(path, 0)
         self._clear_write_cache()
-        ent = self._find(path)
-        if length == 0:
-            buf = ''
-        else:
-            buf = self.store.get(ent.path)
-            buf = buf[:length]
-        prev_size = ent.st_size
-        prev_path = ent.path
-        ent.st_size = length
-        ent.path = self.store.put(buf)
-        try:
-            self._write_index()
-        except:
-            os.remove(ent.path)
-            ent.st_size = prev_size
-            ent.path = prev_path
-            raise
-        self.store.delete(prev_path)
+        with self.transaction() as putx:
+            ent = self._find(path)
+            if length == 0:
+                buf = ''
+            else:
+                buf = self.store.get(ent.encpath)
+                buf = buf[:length]
+            ent.encpath = putx(buf, ent.encpath)
+            ent.size = length
 
     def unlink(self, path):
-        if self.write_path == path:
-            # no need to flush afterwards
-            self._clear_write_cache()
-        dir, name = self._find(path, parent=True)
-        if name not in dir.children:
-            raise FuseOSError(errno.ENOENT)
-        ent = dir.children[name]
-        encpath = self.encroot + '/' + ent.path
-        del dir.children[name]
-        prev_mtime = dir.st_mtime
-        dir.st_mtime = int(time.time())
-        try:
-            self._write_index()
-        except:
-            dir.children[name] = ent
-            dir.st_mtime = prev_mtime
-            raise
-        os.remove(encpath)
+        with self.transaction():
+            if self.write_path == path:
+                # no need to flush afterwards
+                self._clear_write_cache()
+            parent, name = self._find(path, parent=True)
+            if name not in parent.children:
+                raise FuseOSError(errno.ENOENT)
+            ent = parent.children.pop(name)
+            parent.mtime = time.time()
+        self.store.delete(ent.encpath)
 
     def utimens(self, path, times = None):
-        ent = self._find(path)
-        if ent.type == ENT_DIR:
-            prev_mtime = ent.st_mtime
-            if times is None:
-                ent.st_mtime = int(time.time())
-            else:
-                ent.st_mtime = times[1]
-            try:
-                self._write_index()
-            except:
-                ent.st_mtime = prev_mtime
-                raise
+        if times is None:
+            mtime = time.time()
         else:
-            # flush may mess with mtime
-            self.flush(path, 0)
-            encpath = self.encroot + '/' + ent.path
-            os.utime(encpath, times)
+            mtime = times[1]
+        with self.transaction():
+            ent = self._find(path)
+            ent.mtime = mtime
 
     def write(self, path, data, offset, fh):
-        ent = self._find(path)
         if path != self.write_path:
             self.flush(self.write_path, None)
-            buf = self.store.get(ent.path)
+            ent = self._find(path)
+            buf = self.store.get(ent.encpath)
             self.write_buf = [buf]
             self.write_len = len(buf)
         self.write_path = path
