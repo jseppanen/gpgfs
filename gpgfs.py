@@ -191,8 +191,6 @@ class GpgFs(LoggingMixIn, Operations):
                 yield putx
                 # commit
                 write_index(self.store, self.index_path, self.root)
-                if paths['old']:
-                    self.store.delete(paths['old'])
             except:
                 # rollback
                 try:
@@ -204,6 +202,8 @@ class GpgFs(LoggingMixIn, Operations):
                 except:
                     log.exception('rollback failed')
                 raise
+            if paths['old']:
+                self.store.delete(paths['old'])
 
     def chmod(self, path, mode):
         # sanitize mode (clear setuid/gid/sticky bits)
