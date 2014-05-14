@@ -11,6 +11,14 @@ GPG encryption for synchronized folders.
 
     pip install python-gnupg fusepy
 
+# Test suites
+
+* ntfs-3g
+  http://sourceforge.net/p/ntfs-3g/pjd-fstest/ci/master/tree/
+
+* tuxera
+  http://www.tuxera.com/community/posix-test-suite/
+
 # BSD licensed
 
 Copyright © 2014, Jarno Seppänen
