@@ -156,9 +156,6 @@ class GpgFs(LoggingMixIn, Operations):
         self.fd = 0
         self._clear_write_cache()
 
-    def _write_index(self):
-        write_index(self.store, self.index_path, self.root)
-
     def _find(self, path, parent=False):
         assert path.startswith('/')
         if path == '/':
