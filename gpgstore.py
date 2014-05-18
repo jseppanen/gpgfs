@@ -60,6 +60,11 @@ class GpgStore(object):
 
     def delete(self, path):
         os.remove(self.encroot + '/' + path)
+        if len(path) >= 3 and path[2] == '/':
+            try:
+                os.rmdir(self.encroot + '/' + path[:2])
+            except OSError:
+                pass
         log.debug('deleted %s' % path)
 
     def exists(self, path):
