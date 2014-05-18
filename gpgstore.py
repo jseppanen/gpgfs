@@ -20,9 +20,9 @@ class GpgStore(object):
         if not path:
             path = hexlify(os.urandom(20))
             path = path[:2] + '/' + path[2:]
-        encdir = self.encroot + '/' + path[:2]
-        if not os.path.exists(encdir):
-            os.mkdir(encdir, 0755)
+            encdir = self.encroot + '/' + path[:2]
+            if not os.path.exists(encdir):
+                os.mkdir(encdir, 0755)
         res = self.gpg.encrypt(data, self.keyid, armor=False)
         if not res.ok:
             log.error("encryption failed (keyid %s), %s: %s",
