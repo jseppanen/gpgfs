@@ -2,11 +2,12 @@
 import os
 import gnupg
 from binascii import hexlify
-import zlib
 import errno
 import logging
 
 log = logging.getLogger('gpgfs')
+
+FMT_GPG = 0
 
 class GpgStore(object):
     def __init__(self, encroot, keyid):
@@ -14,14 +15,14 @@ class GpgStore(object):
         self.keyid = keyid
         self.gpg = gnupg.GPG()
 
-    def put(self, data, path=None):
+    def put(self, data, path=None, format=FMT_GPG):
+        assert format == FMT_GPG
         if not path:
             path = hexlify(os.urandom(20))
             path = path[:2] + '/' + path[2:]
         encdir = self.encroot + '/' + path[:2]
         if not os.path.exists(encdir):
             os.mkdir(encdir, 0755)
-        data = zlib.compress(data, 1)
         res = self.gpg.encrypt(data, self.keyid, armor=False)
         if not res.ok:
             log.error("encryption failed (keyid %s), %s: %s",
@@ -41,7 +42,8 @@ class GpgStore(object):
         log.debug('encrypted %s' % path)
         return path
 
-    def get(self, path):
+    def get(self, path, format=FMT_GPG):
+        assert format == FMT_GPG
         try:
             data = file(self.encroot + '/' + path).read()
         except OSError, err:
@@ -53,7 +55,6 @@ class GpgStore(object):
         if not res.ok:
             log.error("decryption failed, %s: %s", res.status, path)
             raise OSError(errno.EIO)
-        data = zlib.decompress(res.data)
         log.debug('decrypted %s' % path)
         return data
 

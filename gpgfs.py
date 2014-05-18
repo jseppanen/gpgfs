@@ -34,7 +34,7 @@ def read_index(store, path):
         write_index(store, path, root)
         log.info('created %s', path)
         return root
-    data = store.get(path)
+    data = store.get(path, format=gpgstore.FMT_GPG)
     buf = StringIO(data)
     if buf.read(len(magic)) != magic:
         raise IOError, 'index parse error: %s' % path
@@ -48,7 +48,7 @@ def write_index(store, path, root):
     header = ''
     write_atom(buf, header)
     write_dict(buf, root)
-    store.put(buf.getvalue(), path=path)
+    store.put(buf.getvalue(), path=path, format=gpgstore.FMT_GPG)
 
 def write_dict(fd, dct):
     # breadth-first
@@ -225,7 +225,8 @@ class GpgFs(LoggingMixIn, Operations):
             now = time.time()
             encpath = putx('')
             parent.children[name] = Entry(mode=mode, encpath=encpath, size=0,
-                                          nlink=1, ctime=now, mtime=now)
+                                          nlink=1, ctime=now, mtime=now,
+                                          encformat=gpgstore.FMT_GPG)
             parent.mtime = now
             log.debug('new path %s => %s', path, encpath)
             self.fd += 1
@@ -282,7 +283,7 @@ class GpgFs(LoggingMixIn, Operations):
         self.flush(path, 0)
         ent = self._find(path)
         assert ent.mode & stat.S_IFREG
-        data = self.store.get(ent.encpath)
+        data = self.store.get(ent.encpath, format=ent.encformat)
         return data[offset:offset + size]
 
     def readdir(self, path, fh):
@@ -350,7 +351,7 @@ class GpgFs(LoggingMixIn, Operations):
             if length == 0:
                 buf = ''
             else:
-                buf = self.store.get(ent.encpath)
+                buf = self.store.get(ent.encpath, format=ent.encformat)
                 buf = buf[:length]
             ent.encpath = putx(buf, ent.encpath)
             ent.size = length
@@ -380,7 +381,7 @@ class GpgFs(LoggingMixIn, Operations):
         if path != self.write_path:
             self.flush(self.write_path, None)
             ent = self._find(path)
-            buf = self.store.get(ent.encpath)
+            buf = self.store.get(ent.encpath, format=ent.encformat)
             self.write_buf = [buf]
             self.write_len = len(buf)
         self.write_path = path
